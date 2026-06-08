@@ -5,6 +5,8 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import re
 import chromadb
+import requests  # 🚨 新增：用于去云端 Release 抓取你的 data.zip
+import zipfile   # 🚨 新增：用于在云端自动解压数据
 from openai import OpenAI
 import gradio as gr
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,13 +18,7 @@ import fitz
 # ⚠️ 使用更标准的句子交叉编码器进行重排
 from sentence_transformers import CrossEncoder
 
-# ❌ 原来的不安全写法：
-# API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx" 
-#  现在的安全写法：
-# 让代码去云端服务器的环境变量里秘密读取一个叫 "DEEPSEEK_API_KEY" 的东西
-import os
 API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-
 client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
 
 print("📁 正在通过国内镜像加载 BGE 向量模型 (首次会自动全速下载)...")
@@ -65,12 +61,43 @@ def format_source_html(text):
     return html_template
 
 
-# --- 2. 知识库加载函数 (纯净 PyMuPDF 版) ---
+# --- 2. 知识库加载函数 (新增 Release 自动拉取与解压功能) ---
 def init_db():
+    data_dir = "./data"
+    zip_path = "./data.zip"
+    
+    # 🚨【关键配置】把下面这行双引号里的地址，换成你 GitHub Release 页面里 data.zip 的真实下载链接！
+    release_url = "https://github.com/你的用户名/你的仓库名/releases/download/v1.0/data.zip"
+
+    # 如果本地没有 data 文件夹，说明在云端刚启动，立刻开始自力更生
+    if not os.path.exists(data_dir):
+        # 如果连压缩包都没有，先去 Release 下载
+        if not os.path.exists(zip_path):
+            print("📥 正在从 Release 附件区域全速拉取资产包 data.zip...")
+            try:
+                r = requests.get(release_url, stream=True)
+                with open(zip_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                print("✅ 资产包下载成功！")
+            except Exception as e:
+                print(f"❌ 从 Release 下载资产包失败: {e}")
+        
+        # 拿到压缩包后，原地解压
+        if os.path.exists(zip_path):
+            print("📦 检测到 data.zip，正在为云端系统自动解压数据...")
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall("./")  # 解压在当前根目录下，会自动长出 data/ 文件夹
+                print("✅ 云端数据解压释放完成！")
+            except Exception as e:
+                print(f"❌ 解压失败: {e}")
+
+    # -------- 以下完全保留你原本的数据库初始化与 PDF 解析入库逻辑 --------
     chroma_client = chromadb.PersistentClient(path="./my_vector_db")
     collection = chroma_client.get_or_create_collection(name="auto_reports", embedding_function=zh_ef)
 
-    data_dir = "./data"
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
         return collection
@@ -103,12 +130,9 @@ def init_db():
             text = ""
             for page in doc:
                 page_text = page.get_text()
-                # 简单清洗多余的空白符，但绝不触碰中文字符或数字
                 page_text = re.sub(r'\s+', ' ', page_text)
                 text += page_text + "\n"
             doc.close()
-
-            # ⚠️ 删除了之前那个会导致中文字符全灭的 cid 剔骨正则！
 
             if not text.strip():
                 print(f"⚠️ 警告：{filename} 提取文本为空，可能是图片型 PDF 或极端加密文件！建议更换为券商研报。")
@@ -128,7 +152,7 @@ def init_db():
     return collection
 
 
-# --- 3. 核心交互逻辑与会话管理 ---
+# --- 3. 核心交互逻辑与会话管理 (完全保留) ---
 
 def create_new_chat():
     return [], "", gr.update(value=None), format_source_html("等待检索...")
@@ -169,16 +193,13 @@ def bot_response(history, style_mode, current_session):
             embedding_function=zh_ef
         )
 
-        # 🛠️ 提取所有提及的公司，支持多实体对比
         target_companies = [k for k in COMPANY_KEYWORDS if k in user_message]
 
         if target_companies:
-            # 构建复合过滤字典
             filter_list = [{"company": comp} for comp in target_companies]
             filter_list.append({"company": "宏观政策"})
             search_filter = {"$or": filter_list}
 
-            # 按比例扩大初排召回深度
             base_n_results = 40 * len(target_companies)
             results = collection.query(query_texts=[user_message], n_results=base_n_results, where=search_filter)
         else:
@@ -189,21 +210,15 @@ def bot_response(history, style_mode, current_session):
             formatted_html = format_source_html("等待检索...")
         else:
             retrieved_docs = results['documents'][0]
-
-            # 1. 用户问题与粗排文档两两组合
             pairs = [[user_message, doc] for doc in retrieved_docs]
-
-            # 2. 扔进 BGE 重排模型计算精准得分
             scores = ranker.predict(pairs)
 
-            # 3. 将文档与得分打包，按得分从高到低排序
             reranked_results = sorted(
                 zip(retrieved_docs, scores),
                 key=lambda x: x[1],
                 reverse=True
             )
 
-            # 4. 动态扩大精排后的 Top-N
             top_k = 8 + (max(0, len(target_companies) - 1) * 6)
             top_n_results = [doc for doc, score in reranked_results[:top_k]]
 
@@ -270,11 +285,11 @@ def bot_response(history, style_mode, current_session):
         yield history, formatted_html, current_session
 
 
-# --- 4. 界面构建 ---
+# --- 4. 界面构建 (完全保留) ---
 with gr.Blocks(title="新能源汽车 AI 投研助手", theme=gr.themes.Soft()) as demo:
     current_session = gr.State("")
 
-    gr.Markdown("## 📈 新能源汽车 AI 投研助手 (深度重排版)")
+    gr.Markdown("## 📈 新新能源汽车 AI 投研助手")
 
     with gr.Row():
         with gr.Column(scale=1, min_width=200):
