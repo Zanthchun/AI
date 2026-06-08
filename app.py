@@ -67,7 +67,7 @@ def init_db():
     zip_path = "./data.zip"
     
     # 🚨【关键配置】把下面这行双引号里的地址，换成你 GitHub Release 页面里 data.zip 的真实下载链接！
-    release_url = "https://github.com/你的用户名/你的仓库名/releases/download/v1.0/data.zip"
+    release_url = "sha256:f41a0fd6ab635147b92c046115db4dac5ab4ad5da8a05a432a2f2d561badc08d"
 
     # 如果本地没有 data 文件夹，说明在云端刚启动，立刻开始自力更生
     if not os.path.exists(data_dir):
